@@ -321,6 +321,78 @@ function loadDB() {
 function saveDB() { localStorage.setItem('ironlog_v2', JSON.stringify(DB)); }
 
 // ═══════════════════════════════════════════
+// AUTOSAVE — saves in-progress session to localStorage on every change
+// ═══════════════════════════════════════════
+function autosave() {
+  if (!currentSession) return;
+  const saveData = {
+    session: currentSession,
+    sessionStart: sessionStart,
+    savedAt: Date.now()
+  };
+  localStorage.setItem('ironlog_autosave', JSON.stringify(saveData));
+}
+
+function clearAutosave() {
+  localStorage.removeItem('ironlog_autosave');
+}
+
+function checkAutosaveRecovery() {
+  try {
+    const raw = localStorage.getItem('ironlog_autosave');
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (!saved.session || !saved.session.split) { clearAutosave(); return; }
+
+    // Check if this session was already finished (exists in DB with same date)
+    const alreadySaved = DB.sessions.some(s =>
+      s.date === saved.session.date && s.split === saved.session.split
+    );
+    if (alreadySaved) { clearAutosave(); return; }
+
+    // Check if any data was actually entered
+    const hasData = saved.session.exercises.some(ex =>
+      ex.sets.some(s => s.reps || s.weight)
+    );
+    if (!hasData) { clearAutosave(); return; }
+
+    const when = new Date(saved.savedAt);
+    const timeStr = when.toLocaleString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+
+    if (confirm(`Recover unsaved ${saved.session.splitName} workout from ${timeStr}?`)) {
+      currentSession = saved.session;
+      sessionStart = saved.sessionStart || Date.now();
+      document.getElementById('splitPicker').classList.add('hidden');
+      document.getElementById('activeSession').classList.remove('hidden');
+      document.getElementById('sessionBar').classList.remove('hidden');
+
+      const split = SPLITS[currentSession.split];
+      const d = new Date(currentSession.date);
+      const isoDate = d.toISOString().slice(0, 10);
+      const dateStr = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+      document.getElementById('sessionSplitLabel').innerHTML =
+        `<div style="margin-bottom:12px">
+          <span class="split-label ${split ? split.color : ''}">${currentSession.splitName}</span>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+            <span id="sessionDateDisplay" style="color:var(--muted);font-size:14px;cursor:pointer" onclick="showDatePicker()">${dateStr}</span>
+            <button onclick="showDatePicker()" style="background:transparent;color:var(--accent);font-size:12px;padding:2px 6px">Edit</button>
+          </div>
+          <input type="date" id="sessionDateInput" value="${isoDate}"
+            style="display:none;margin-top:6px"
+            onchange="updateSessionDate(this.value)">
+        </div>`;
+
+      startSessionTimer();
+      renderExercises();
+    } else {
+      clearAutosave();
+    }
+  } catch(e) {
+    clearAutosave();
+  }
+}
+
+// ═══════════════════════════════════════════
 // TABS
 // ═══════════════════════════════════════════
 document.querySelectorAll('.tab').forEach(t => {
@@ -385,11 +457,18 @@ function startSplit(splitKey) {
   document.getElementById('activeSession').classList.remove('hidden');
   document.getElementById('sessionBar').classList.remove('hidden');
   const now = new Date();
+  const isoDate = now.toISOString().slice(0, 10); // YYYY-MM-DD for input
   const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
   document.getElementById('sessionSplitLabel').innerHTML =
     `<div style="margin-bottom:12px">
       <span class="split-label ${split.color}">${split.name}</span>
-      <div style="color:var(--muted);font-size:14px;margin-top:8px">${dateStr}</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+        <span id="sessionDateDisplay" style="color:var(--muted);font-size:14px;cursor:pointer" onclick="showDatePicker()">${dateStr}</span>
+        <button onclick="showDatePicker()" style="background:transparent;color:var(--accent);font-size:12px;padding:2px 6px">Edit</button>
+      </div>
+      <input type="date" id="sessionDateInput" value="${isoDate}"
+        style="display:none;margin-top:6px"
+        onchange="updateSessionDate(this.value)">
     </div>`;
 
   startSessionTimer();
@@ -406,12 +485,13 @@ function renderExercises() {
     currentSession.exercises.length + ' exercises';
 
   list.innerHTML = currentSession.exercises.map((ex, ei) => {
-    // "Last time" summary
+    // "Last time" summary + previous notes
     let lastStr = '';
     if (ex.lastData && ex.lastData.sets.length > 0) {
       const ls = ex.lastData.sets;
       const summary = ls.map((s, i) => `${s.weight} ${ls[0].unit || 'lbs'} × ${s.reps} reps`).join(', ');
-      lastStr = `<div class="ex-card-last">Last: ${esc(summary)}</div>`;
+      const prevNote = ex.lastData.notes ? `<div class="ex-card-last" style="color:var(--orange);font-style:normal">&#9998; ${esc(ex.lastData.notes)}</div>` : '';
+      lastStr = `<div class="ex-card-last">Last: ${esc(summary)}</div>${prevNote}`;
     }
 
     const setsHtml = ex.sets.map((s, si) => `
@@ -474,15 +554,39 @@ function updateSet(ei, si, field, value) {
   } else {
     currentSession.exercises[ei].sets[si][field] = value;
   }
+  autosave();
 }
 
 function updateExName(ei, value) {
   const trimmed = value.trim();
   if (trimmed) currentSession.exercises[ei].name = trimmed;
+  autosave();
 }
 
 function updateNote(ei, value) {
   currentSession.exercises[ei].notes = value;
+  autosave();
+}
+
+function showDatePicker() {
+  const input = document.getElementById('sessionDateInput');
+  input.style.display = input.style.display === 'none' ? 'block' : 'none';
+}
+
+function updateSessionDate(dateVal) {
+  if (!currentSession || !dateVal) return;
+  // Keep the time portion, just change the date
+  const parts = dateVal.split('-');
+  const newDate = new Date(currentSession.date);
+  newDate.setFullYear(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+  currentSession.date = newDate.toISOString();
+  // Update display
+  const display = document.getElementById('sessionDateDisplay');
+  if (display) {
+    display.textContent = newDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  }
+  document.getElementById('sessionDateInput').style.display = 'none';
+  autosave();
 }
 
 function addSet(ei) {
@@ -558,6 +662,7 @@ function finishSession() {
   delete currentSession.color; // don't need in storage
   DB.sessions.unshift(currentSession);
   saveDB();
+  clearAutosave();
   endSession();
   document.querySelectorAll('.tab')[2].click();
 }
@@ -573,6 +678,7 @@ function cancelSession() {
 }
 
 function endSession() {
+  clearAutosave();
   currentSession = null;
   sessionStart = null;
   clearInterval(sessionInterval);
@@ -783,6 +889,9 @@ document.getElementById('exportBtn').addEventListener('click', () => {
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
 
 renderHistory();
+
+// Check for unsaved workout on page load
+checkAutosaveRecovery();
 </script>
 </body>
 </html>
