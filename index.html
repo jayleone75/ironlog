@@ -108,6 +108,23 @@ textarea{resize:vertical;min-height:60px}
 
 .history-date{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;padding:12px 0 6px}
 
+/* Insights */
+.insight-section{margin-bottom:20px}
+.insight-section-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:8px}
+.insight-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+.insight-row:last-child{border-bottom:none}
+.insight-label{font-size:14px;font-weight:500}
+.insight-value{font-size:14px;font-weight:700;text-align:right}
+.insight-sub{font-size:12px;color:var(--muted);margin-top:2px}
+.tag-pr{color:var(--accent2)}
+.tag-up{color:var(--accent2)}
+.tag-stall{color:var(--orange)}
+.tag-warn{color:var(--danger)}
+.tip-card{background:var(--surface);border-left:3px solid var(--accent);border-radius:8px;padding:12px 14px;margin-bottom:8px;font-size:14px;line-height:1.5}
+.tip-card.warn{border-left-color:var(--orange)}
+.claude-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:16px;border-radius:12px;background:linear-gradient(135deg,#4a3f6b,#2d3a5e);color:#e8e8e8;font-size:15px;font-weight:600;margin-top:8px;border:1px solid #5a4f8a}
+.claude-btn:active{opacity:.85;transform:scale(.98)}
+
 .hidden{display:none!important}
 .fade-in{animation:fadeIn .2s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
@@ -133,7 +150,8 @@ textarea{resize:vertical;min-height:60px}
   <div class="tabs">
     <button class="tab active" data-tab="workout">Workout</button>
     <button class="tab" data-tab="timer">Timer</button>
-    <button class="tab" data-tab="history">History</button>
+    <button class="tab" data-tab="insights">Insights</button>
+    <button class="tab" data-tab="history">Log</button>
   </div>
 
   <!-- WORKOUT TAB -->
@@ -192,6 +210,15 @@ textarea{resize:vertical;min-height:60px}
       </div>
     </div>
     <p style="text-align:center;color:var(--muted);font-size:13px;margin-top:8px">Tap a preset or let it count up</p>
+  </div>
+
+  <!-- INSIGHTS TAB -->
+  <div id="tab-insights" class="tab-content hidden">
+    <div id="insightsContent"></div>
+    <div id="insightsEmpty" class="empty hidden">
+      <div class="empty-icon">&#128202;</div>
+      <div class="empty-text">Complete at least one workout<br>to see insights</div>
+    </div>
   </div>
 
   <!-- HISTORY TAB -->
@@ -402,6 +429,7 @@ document.querySelectorAll('.tab').forEach(t => {
     t.classList.add('active');
     document.getElementById('tab-' + t.dataset.tab).classList.remove('hidden');
     if (t.dataset.tab === 'history') renderHistory();
+    if (t.dataset.tab === 'insights') renderInsights();
   });
 });
 
@@ -860,6 +888,265 @@ function showSessionDetail(idx) {
     }
   };
   document.getElementById('sessionDetailModal').classList.remove('hidden');
+}
+
+// ═══════════════════════════════════════════
+// INSIGHTS ENGINE
+// ═══════════════════════════════════════════
+
+// Dorian Yates HIT principles — contextual tip pool
+const DY_TIPS = {
+  general: [
+    "DY principle: One all-out working set taken to failure beats three comfortable sets every time. If you could have done another rep, you didn't go hard enough.",
+    "Dorian trained each body part once every 5-7 days. Muscles grow during recovery, not during the workout itself.",
+    "Focus on the negative (eccentric) phase — lower the weight in 3-4 seconds. DY credited this for much of his mass gains.",
+    "Progressive overload is the only rule that matters. If the weight isn't going up over time, something needs to change.",
+    "DY: 'Train like your life depends on it, but train smart. Injuries set you back months.'",
+  ],
+  chest: [
+    "For chest, DY emphasized the stretch at the bottom of the movement. Don't rush through the bottom of your DB Press.",
+    "On machine flies, focus on squeezing the chest at the top — DY used the contraction as the goal, not just moving the weight.",
+    "DY kept skull crushers strict and controlled. If elbows are flaring, drop the weight.",
+  ],
+  back: [
+    "DY's lat pulldown tip: initiate with your elbows, not your hands. Think of your hands as hooks.",
+    "On rows, DY pulled toward his lower abdomen, not his chest — this hits the lower lats and adds thickness.",
+    "Cable pullovers were DY's favorite lat isolation. Keep a slight bend in the elbows and feel the stretch at the top.",
+  ],
+  legs: [
+    "DY believed leg press was safer than squats for most bodybuilders and allowed heavier loading with less injury risk.",
+    "On leg extensions, pause at the top and squeeze the quad for 1-2 seconds — DY used this to build the teardrop.",
+    "Hack squats: keep your feet shoulder-width and low on the platform to maximize quad recruitment.",
+    "DY always finished legs with stiff-leg deadlifts for hamstring stretch — the stretch under load is key.",
+  ],
+  shoulders: [
+    "DY's shoulder tip: leave your ego at the door on lateral raises. Perfect form with lighter weight beats sloppy form with heavy.",
+    "Rear delt work was a priority for DY — underdeveloped rear delts are one of the most common physique weaknesses.",
+    "On DB press, DY used a neutral grip angle (not straight out to the sides) to reduce shoulder joint stress.",
+  ],
+};
+
+function getRandomTip(splitKey) {
+  const specific = DY_TIPS[splitKey] || [];
+  const pool = [...specific, ...DY_TIPS.general];
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function renderInsights() {
+  const content = document.getElementById('insightsContent');
+  const empty = document.getElementById('insightsEmpty');
+
+  if (DB.sessions.length === 0) {
+    content.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+
+  // ── Build per-exercise history map ──
+  // exerciseHistory[splitKey][exerciseName] = [{ date, maxWeight, sets, notes }, ...]
+  const exerciseHistory = {};
+  [...DB.sessions].reverse().forEach(session => {
+    const sk = session.split;
+    if (!exerciseHistory[sk]) exerciseHistory[sk] = {};
+    session.exercises.forEach(ex => {
+      if (!exerciseHistory[sk][ex.name]) exerciseHistory[sk][ex.name] = [];
+      const maxWeight = Math.max(...ex.sets.map(s => Number(s.weight) || 0));
+      const unit = ex.sets[0]?.unit || 'lbs';
+      exerciseHistory[sk][ex.name].push({
+        date: session.date,
+        maxWeight,
+        unit,
+        sets: ex.sets,
+        notes: ex.notes || ''
+      });
+    });
+  });
+
+  // ── PRs (personal records) ──
+  // A PR = the most recent session for an exercise hit the all-time highest weight
+  const prs = [];
+  Object.entries(exerciseHistory).forEach(([sk, exercises]) => {
+    Object.entries(exercises).forEach(([name, history]) => {
+      if (history.length < 2) return; // need at least 2 sessions to compare
+      const allMax = Math.max(...history.map(h => h.maxWeight));
+      const latest = history[history.length - 1];
+      if (latest.maxWeight >= allMax && latest.maxWeight > 0) {
+        const prev = history[history.length - 2];
+        const diff = latest.maxWeight - (prev?.maxWeight || 0);
+        prs.push({ name, weight: latest.maxWeight, unit: latest.unit, diff, split: sk });
+      }
+    });
+  });
+
+  // ── Stalls (same max weight for 3+ consecutive sessions) ──
+  const stalls = [];
+  Object.entries(exerciseHistory).forEach(([sk, exercises]) => {
+    Object.entries(exercises).forEach(([name, history]) => {
+      if (history.length < 3) return;
+      const last3 = history.slice(-3);
+      const weights = last3.map(h => h.maxWeight);
+      if (weights[0] > 0 && weights.every(w => w === weights[0])) {
+        stalls.push({ name, weight: weights[0], unit: last3[0].unit, sessions: last3.length, split: sk });
+      }
+    });
+  });
+
+  // ── Volume trends (last 4 vs previous 4 sessions per split) ──
+  const volumeTrends = {};
+  const splitKeys = ['chest', 'back', 'legs', 'shoulders'];
+  splitKeys.forEach(sk => {
+    const splitSessions = DB.sessions.filter(s => s.split === sk);
+    if (splitSessions.length < 2) return;
+    const calcVol = (sessions) => sessions.reduce((total, s) =>
+      total + s.exercises.reduce((et, ex) =>
+        et + ex.sets.reduce((st, set) => st + (Number(set.reps) || 0) * (Number(set.weight) || 0), 0), 0), 0);
+    const recent = splitSessions.slice(0, Math.min(4, Math.ceil(splitSessions.length / 2)));
+    const older = splitSessions.slice(Math.min(4, Math.ceil(splitSessions.length / 2)));
+    if (older.length === 0) return;
+    const recentVol = calcVol(recent);
+    const olderVol = calcVol(older);
+    if (olderVol === 0) return;
+    const pct = Math.round(((recentVol - olderVol) / olderVol) * 100);
+    volumeTrends[sk] = { pct, recentVol, splitName: SPLITS[sk].name };
+  });
+
+  // ── Rest days since last session per split ──
+  const restDays = {};
+  splitKeys.forEach(sk => {
+    const last = DB.sessions.find(s => s.split === sk);
+    if (!last) return;
+    const days = Math.floor((Date.now() - new Date(last.date).getTime()) / 86400000);
+    restDays[sk] = { days, splitName: SPLITS[sk].name };
+  });
+
+  // ── Most recent split (for contextual tip) ──
+  const lastSplit = DB.sessions[0]?.split || 'general';
+
+  // ── Render ──
+  let html = '';
+
+  // PRs section
+  if (prs.length > 0) {
+    html += `<div class="card insight-section">
+      <div class="insight-section-title">🏆 Personal Records — Last Session</div>
+      ${prs.map(pr => `
+        <div class="insight-row">
+          <div><div class="insight-label tag-pr">&#9651; ${esc(pr.name)}</div>
+          <div class="insight-sub">${SPLITS[pr.split]?.name || pr.split}</div></div>
+          <div class="insight-value tag-pr">${pr.weight} ${pr.unit}${pr.diff > 0 ? ` <span style="font-size:12px;color:var(--muted)">+${pr.diff}</span>` : ''}</div>
+        </div>`).join('')}
+    </div>`;
+  }
+
+  // Stalls section
+  if (stalls.length > 0) {
+    html += `<div class="card insight-section">
+      <div class="insight-section-title">⚠️ Stalled — Same Weight 3+ Sessions</div>
+      ${stalls.map(s => `
+        <div class="insight-row">
+          <div><div class="insight-label tag-stall">${esc(s.name)}</div>
+          <div class="insight-sub">${SPLITS[s.split]?.name || s.split}</div></div>
+          <div class="insight-value tag-stall">${s.weight} ${s.unit}</div>
+        </div>`).join('')}
+      <div style="font-size:12px;color:var(--muted);margin-top:10px;line-height:1.5">
+        DY tip: Try a forced rep, drop set, or rest-pause to break through. Or accept the weight and push for more reps.
+      </div>
+    </div>`;
+  }
+
+  // Volume trends
+  const trendEntries = Object.entries(volumeTrends);
+  if (trendEntries.length > 0) {
+    html += `<div class="card insight-section">
+      <div class="insight-section-title">📈 Volume Trend (Recent vs Earlier)</div>
+      ${trendEntries.map(([sk, t]) => `
+        <div class="insight-row">
+          <div class="insight-label">${esc(t.splitName)}</div>
+          <div class="insight-value ${t.pct >= 0 ? 'tag-up' : 'tag-warn'}">${t.pct >= 0 ? '+' : ''}${t.pct}%</div>
+        </div>`).join('')}
+    </div>`;
+  }
+
+  // Rest days
+  const restEntries = Object.entries(restDays);
+  if (restEntries.length > 0) {
+    html += `<div class="card insight-section">
+      <div class="insight-section-title">🗓 Days Since Last Session</div>
+      ${restEntries.map(([sk, r]) => {
+        const warn = r.days < 4;
+        const good = r.days >= 5 && r.days <= 7;
+        const cls = warn ? 'tag-warn' : good ? 'tag-up' : '';
+        const note = warn ? 'too soon?' : good ? 'well rested' : r.days > 7 ? 'get back in' : '';
+        return `<div class="insight-row">
+          <div class="insight-label">${esc(r.splitName)}</div>
+          <div class="insight-value ${cls}">${r.days}d ${note ? `<span style="font-size:11px;font-weight:400">${note}</span>` : ''}</div>
+        </div>`;
+      }).join('')}
+      <div style="font-size:12px;color:var(--muted);margin-top:10px">DY recommended 5-7 days between same muscle groups.</div>
+    </div>`;
+  }
+
+  // DY Tip of the day
+  html += `<div class="card insight-section">
+    <div class="insight-section-title">💡 DY Principle</div>
+    <div class="tip-card">${esc(getRandomTip(lastSplit))}</div>
+  </div>`;
+
+  // Analyze with Claude button
+  html += `<button class="claude-btn" onclick="analyzeWithClaude()">
+    🤖 Analyze My Workouts with Claude
+  </button>
+  <p style="text-align:center;color:var(--muted);font-size:12px;margin-top:8px">
+    Copies your data &amp; opens Claude.ai — just paste
+  </p>`;
+
+  content.innerHTML = html;
+}
+
+function analyzeWithClaude() {
+  if (DB.sessions.length === 0) { alert('No workout data yet.'); return; }
+
+  // Build a structured prompt with full history
+  const lines = [];
+  lines.push('I follow a Dorian Yates-style Blood & Guts HIT training split. Please analyze my workout history below and give me specific, actionable advice.\n');
+  lines.push('My 4-day split: Chest & Triceps | Back & Biceps | Legs | Shoulders\n');
+  lines.push('Please cover:\n1. Progression — where am I getting stronger, where am I stalling?\n2. Volume — is it trending up or down per split?\n3. Any red flags or imbalances you notice\n4. Specific advice for my NEXT session of each split\n5. Any DY HIT principles I should apply based on my data\n');
+  lines.push('---\nWORKOUT HISTORY (most recent first):\n');
+
+  DB.sessions.slice(0, 20).forEach(session => {
+    const d = new Date(session.date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+    lines.push(`\n[${d}] ${session.splitName || session.split}`);
+    session.exercises.forEach(ex => {
+      const setStr = ex.sets.map(s => `${s.weight}${s.unit||'lbs'}×${s.reps}`).join(', ');
+      lines.push(`  ${ex.name}: ${setStr}${ex.notes ? ` (note: ${ex.notes})` : ''}`);
+    });
+  });
+
+  const prompt = lines.join('\n');
+
+  // Copy to clipboard
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(prompt).then(() => {
+      window.open('https://claude.ai/new', '_blank');
+      setTimeout(() => alert('Your workout data is copied to clipboard.\n\nClaude.ai is opening — just paste it in (long-press → Paste).'), 500);
+    }).catch(() => fallbackCopy(prompt));
+  } else {
+    fallbackCopy(prompt);
+  }
+}
+
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+  window.open('https://claude.ai/new', '_blank');
+  setTimeout(() => alert('Workout data copied! Paste it into Claude.ai.'), 400);
 }
 
 // ═══════════════════════════════════════════
