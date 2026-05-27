@@ -252,9 +252,10 @@ textarea{resize:vertical;min-height:60px}
     <div class="modal-handle"></div>
     <h2 id="detailTitle">Session Detail</h2>
     <div id="detailContent"></div>
-    <div style="margin-top:16px;display:flex;gap:10px">
-      <button class="btn btn-outline" onclick="document.getElementById('sessionDetailModal').classList.add('hidden')">Close</button>
-      <button class="btn btn-danger btn-sm" id="deleteSessionBtn" style="width:auto;padding:8px 16px">Delete</button>
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary btn-sm" id="shareSessionBtn" style="flex:1;min-width:110px">📤 Share Workout</button>
+      <button class="btn btn-outline btn-sm" onclick="document.getElementById('sessionDetailModal').classList.add('hidden')" style="flex:1;min-width:80px">Close</button>
+      <button class="btn btn-danger btn-sm" id="deleteSessionBtn" style="flex:1;min-width:80px;padding:8px 16px">Delete</button>
     </div>
   </div>
 </div>
@@ -398,8 +399,8 @@ const SPLITS = {
 // ═══════════════════════════════════════════
 // VERSION & STORAGE KEYS
 // ═══════════════════════════════════════════
-const APP_VERSION = '2.3.0';
-const SCHEMA_VERSION = 1;
+const APP_VERSION = '2.4.0';
+const SCHEMA_VERSION = 2;
 const STORAGE_KEY = 'ironlog_v2';
 const BACKUP_KEY_PREFIX = 'ironlog_v2_backup_';
 const BACKUP_GENERATIONS = 3;
@@ -423,14 +424,39 @@ function loadDB() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { schemaVersion: SCHEMA_VERSION, sessions: [], photos: {} };
     const parsed = JSON.parse(raw);
-    // Backward compat: older data stored as { sessions: [...] } with no schemaVersion
-    if (!parsed.schemaVersion) parsed.schemaVersion = SCHEMA_VERSION;
+    if (!parsed.schemaVersion) parsed.schemaVersion = 1;
     if (!Array.isArray(parsed.sessions)) parsed.sessions = [];
     if (!parsed.photos || typeof parsed.photos !== 'object') parsed.photos = {};
+    // ── Migration v1 → v2: move exercise-level photos onto their most recent session ──
+    if (parsed.schemaVersion < 2) {
+      migratePhotosToSessions(parsed);
+      parsed.schemaVersion = 2;
+    }
     return parsed;
   } catch(e) {
     return { schemaVersion: SCHEMA_VERSION, sessions: [], photos: {} };
   }
+}
+
+// One-time migration: each (splitKey||exerciseName) photo attaches to the most recent
+// session of that split that contains that exercise. DB.photos is preserved as a
+// legacy fallback but new code reads from session.exercises[*].photo.
+function migratePhotosToSessions(db) {
+  const photos = db.photos || {};
+  const keys = Object.keys(photos);
+  if (keys.length === 0) return;
+  // Sessions assumed newest-first (the app already maintains this order)
+  keys.forEach(k => {
+    const sep = k.indexOf('||');
+    if (sep === -1) return;
+    const splitKey = k.slice(0, sep);
+    const exName = k.slice(sep + 2);
+    const photoData = photos[k];
+    const targetSession = db.sessions.find(s => s.split === splitKey && s.exercises.some(e => e.name === exName));
+    if (!targetSession) return;
+    const targetEx = targetSession.exercises.find(e => e.name === exName);
+    if (targetEx && !targetEx.photo) targetEx.photo = photoData;
+  });
 }
 
 function saveDB() {
@@ -490,45 +516,77 @@ function restoreFromBackup(slot) {
 }
 
 // ═══════════════════════════════════════════
-// EXERCISE PHOTOS
+// EXERCISE PHOTOS (per-session)
 // ═══════════════════════════════════════════
-// Photos are keyed by splitKey + '||' + exerciseName, stored as data URLs
-// in DB.photos. They describe "the machine I use for this exercise on this split."
-function photoKey(splitKey, exerciseName) {
-  return splitKey + '||' + exerciseName;
-}
-function getPhoto(splitKey, exerciseName) {
-  return DB.photos[photoKey(splitKey, exerciseName)] || null;
-}
-function setPhoto(splitKey, exerciseName, dataUrl) {
-  DB.photos[photoKey(splitKey, exerciseName)] = dataUrl;
-  saveDB();
-}
-function deletePhoto(splitKey, exerciseName) {
-  delete DB.photos[photoKey(splitKey, exerciseName)];
-  saveDB();
+// Photos live on session.exercises[i].photo as a data URL. They represent
+// the specific machine used for that exercise on that day.
+
+// Find the photo for an exercise *in a specific session*. Returns null if none.
+function getSessionPhoto(session, exerciseName) {
+  if (!session || !session.exercises) return null;
+  const ex = session.exercises.find(e => e.name === exerciseName);
+  return (ex && ex.photo) ? ex.photo : null;
 }
 
-// Track which exercise the file input is currently capturing for
+// Find the most recent photo for (splitKey, exerciseName) across history — used
+// as a "Last:" reference thumbnail when starting a new session.
+function getLastPhotoForExercise(splitKey, exerciseName) {
+  for (let i = 0; i < DB.sessions.length; i++) {
+    const s = DB.sessions[i];
+    if (s.split !== splitKey) continue;
+    const ex = s.exercises.find(e => e.name === exerciseName);
+    if (ex && ex.photo) return { dataUrl: ex.photo, date: s.date };
+  }
+  return null;
+}
+
+// Set/delete photo on the *current* session's exercise (by index).
+function setCurrentSessionPhoto(ei, dataUrl) {
+  if (!currentSession || !currentSession.exercises[ei]) return;
+  currentSession.exercises[ei].photo = dataUrl;
+  autosave();
+}
+function deleteCurrentSessionPhoto(ei) {
+  if (!currentSession || !currentSession.exercises[ei]) return;
+  delete currentSession.exercises[ei].photo;
+  autosave();
+}
+// Set/delete photo on a *historical* session (by session index + exercise name)
+function setHistoricalPhoto(sessionIdx, exerciseName, dataUrl) {
+  const s = DB.sessions[sessionIdx];
+  if (!s) return;
+  const ex = s.exercises.find(e => e.name === exerciseName);
+  if (ex) { ex.photo = dataUrl; saveDB(); }
+}
+function deleteHistoricalPhoto(sessionIdx, exerciseName) {
+  const s = DB.sessions[sessionIdx];
+  if (!s) return;
+  const ex = s.exercises.find(e => e.name === exerciseName);
+  if (ex) { delete ex.photo; saveDB(); }
+}
+
+// Track what the camera input is capturing for: either an exercise index
+// in the current session, or { sessionIdx, exerciseName } for historical edits.
 let pendingPhotoCapture = null;
 
 function capturePhotoFor(ei) {
   if (!currentSession) return;
-  pendingPhotoCapture = ei;
+  pendingPhotoCapture = { kind: 'current', ei };
+  document.getElementById('exercisePhotoInput').click();
+}
+
+function captureHistoricalPhoto(sessionIdx, exerciseName) {
+  pendingPhotoCapture = { kind: 'historical', sessionIdx, exerciseName };
   document.getElementById('exercisePhotoInput').click();
 }
 
 function handlePhotoSelected(event) {
   const file = event.target.files[0];
-  event.target.value = ''; // reset so same file could be picked again
-  if (!file || pendingPhotoCapture === null) return;
-  const ei = pendingPhotoCapture;
+  event.target.value = ''; // reset
+  const capture = pendingPhotoCapture;
   pendingPhotoCapture = null;
-  if (!currentSession || !currentSession.exercises[ei]) return;
-  const exerciseName = currentSession.exercises[ei].name;
-  const splitKey = currentSession.split;
+  if (!file || !capture) return;
 
-  // Compress: resize longest edge to 800px, JPEG quality 0.75
   const reader = new FileReader();
   reader.onload = (e) => {
     const img = new Image();
@@ -542,8 +600,13 @@ function handlePhotoSelected(event) {
       canvas.getContext('2d').drawImage(img, 0, 0, w, h);
       const dataUrl = canvas.toDataURL('image/jpeg', 0.75);
       try {
-        setPhoto(splitKey, exerciseName, dataUrl);
-        renderExercises();
+        if (capture.kind === 'current') {
+          setCurrentSessionPhoto(capture.ei, dataUrl);
+          renderExercises();
+        } else {
+          setHistoricalPhoto(capture.sessionIdx, capture.exerciseName, dataUrl);
+          showSessionDetail(capture.sessionIdx);
+        }
       } catch(err) {
         alert('Could not save photo — storage may be full. Try deleting an older photo first.\n\n' + err.message);
       }
@@ -555,25 +618,43 @@ function handlePhotoSelected(event) {
   reader.readAsDataURL(file);
 }
 
-function openPhotoModal(splitKey, exerciseName) {
-  const photo = getPhoto(splitKey, exerciseName);
-  if (!photo) return;
-  document.getElementById('photoModalImg').src = photo;
-  document.getElementById('photoModalTitle').textContent = exerciseName;
-  // Wire up replace/delete buttons
+// Photo modal — used to view a photo with replace/delete actions.
+// ctx is either { kind: 'current', ei } or { kind: 'historical', sessionIdx, exerciseName }.
+function openCurrentPhotoModal(ei) {
+  if (!currentSession || !currentSession.exercises[ei]) return;
+  const ex = currentSession.exercises[ei];
+  if (!ex.photo) return;
+  document.getElementById('photoModalImg').src = ex.photo;
+  document.getElementById('photoModalTitle').textContent = ex.name;
   document.getElementById('photoModalReplaceBtn').onclick = () => {
     document.getElementById('photoModal').classList.add('hidden');
-    // Find the exercise index in current session and trigger capture
-    if (!currentSession) { alert('Start a workout to update photos.'); return; }
-    const ei = currentSession.exercises.findIndex(e => e.name === exerciseName);
-    if (ei === -1) { alert('This exercise is not in the current session.'); return; }
     capturePhotoFor(ei);
   };
   document.getElementById('photoModalDeleteBtn').onclick = () => {
-    if (!confirm('Delete the photo for ' + exerciseName + '?')) return;
-    deletePhoto(splitKey, exerciseName);
+    if (!confirm('Delete the photo for ' + ex.name + '?')) return;
+    deleteCurrentSessionPhoto(ei);
     document.getElementById('photoModal').classList.add('hidden');
-    if (currentSession) renderExercises();
+    renderExercises();
+  };
+  document.getElementById('photoModal').classList.remove('hidden');
+}
+
+function openHistoricalPhotoModal(sessionIdx, exerciseName) {
+  const s = DB.sessions[sessionIdx];
+  if (!s) return;
+  const ex = s.exercises.find(e => e.name === exerciseName);
+  if (!ex || !ex.photo) return;
+  document.getElementById('photoModalImg').src = ex.photo;
+  document.getElementById('photoModalTitle').textContent = exerciseName + ' — ' + new Date(s.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  document.getElementById('photoModalReplaceBtn').onclick = () => {
+    document.getElementById('photoModal').classList.add('hidden');
+    captureHistoricalPhoto(sessionIdx, exerciseName);
+  };
+  document.getElementById('photoModalDeleteBtn').onclick = () => {
+    if (!confirm('Delete this photo?')) return;
+    deleteHistoricalPhoto(sessionIdx, exerciseName);
+    document.getElementById('photoModal').classList.add('hidden');
+    showSessionDetail(sessionIdx);
   };
   document.getElementById('photoModal').classList.remove('hidden');
 }
@@ -816,15 +897,24 @@ function renderExercises() {
       </div>
     `).join('');
 
-    // Photo state for this exercise
-    const photoData = getPhoto(currentSession.split, ex.name);
-    const photoBtnHtml = photoData
-      ? `<button class="btn-ghost" onclick="openPhotoModal('${currentSession.split}', '${esc(ex.name).replace(/'/g, "\\'")}')" title="View photo" style="padding:2px 4px;flex-shrink:0;background:transparent">
-           <img src="${photoData}" alt="" style="width:28px;height:28px;border-radius:6px;object-fit:cover;border:1px solid var(--border);display:block">
-         </button>`
-      : `<button class="btn-ghost" onclick="capturePhotoFor(${ei})" title="Take photo of machine" style="padding:4px 8px;flex-shrink:0;color:var(--muted);font-size:16px">
+    // Photo for this exercise — current session first, else last session as faded reference
+    const currentPhoto = (ex.photo) || null;
+    const lastPhoto = currentPhoto ? null : getLastPhotoForExercise(currentSession.split, ex.name);
+    let photoBtnHtml;
+    if (currentPhoto) {
+      photoBtnHtml = `<button class="btn-ghost" onclick="openCurrentPhotoModal(${ei})" title="View photo" style="padding:2px 4px;flex-shrink:0;background:transparent">
+           <img src="${currentPhoto}" alt="" style="width:28px;height:28px;border-radius:6px;object-fit:cover;border:1px solid var(--border);display:block">
+         </button>`;
+    } else if (lastPhoto) {
+      photoBtnHtml = `<button class="btn-ghost" onclick="capturePhotoFor(${ei})" title="Capture today's photo (last session shown faded)" style="padding:2px 4px;flex-shrink:0;background:transparent;position:relative">
+           <img src="${lastPhoto.dataUrl}" alt="" style="width:28px;height:28px;border-radius:6px;object-fit:cover;border:1px dashed var(--muted);display:block;opacity:0.45">
+           <span style="position:absolute;bottom:-2px;right:-2px;background:var(--bg);color:var(--accent);font-size:14px;line-height:1;padding:1px;border-radius:50%">&#128247;</span>
+         </button>`;
+    } else {
+      photoBtnHtml = `<button class="btn-ghost" onclick="capturePhotoFor(${ei})" title="Take photo of machine" style="padding:4px 8px;flex-shrink:0;color:var(--muted);font-size:16px">
            &#128247;
          </button>`;
+    }
 
     return `
       <div class="ex-card fade-in">
@@ -951,16 +1041,20 @@ function finishSession() {
     return;
   }
 
-  // Clean up: remove lastData refs, filter out empty sets
-  currentSession.exercises = currentSession.exercises.map(ex => ({
-    name: ex.name,
-    sets: ex.sets.filter(s => s.reps || s.weight).map(s => ({
-      reps: Number(s.reps) || 0,
-      weight: Number(s.weight) || 0,
-      unit: s.unit || 'lbs'
-    })),
-    notes: ex.notes || ''
-  })).filter(ex => ex.sets.length > 0);
+  // Clean up: remove lastData refs, filter out empty sets, preserve photo if present
+  currentSession.exercises = currentSession.exercises.map(ex => {
+    const cleaned = {
+      name: ex.name,
+      sets: ex.sets.filter(s => s.reps || s.weight).map(s => ({
+        reps: Number(s.reps) || 0,
+        weight: Number(s.weight) || 0,
+        unit: s.unit || 'lbs'
+      })),
+      notes: ex.notes || ''
+    };
+    if (ex.photo) cleaned.photo = ex.photo;
+    return cleaned;
+  }).filter(ex => ex.sets.length > 0);
 
   currentSession.duration = Math.floor((Date.now() - sessionStart) / 1000);
   delete currentSession.color; // don't need in storage
@@ -1111,6 +1205,8 @@ function renderHistory() {
     const dur = session.duration ? formatTime(session.duration) : '--';
     const splitColor = colorMap[session.split] || 'var(--accent)';
     const splitName = session.splitName || session.split || 'Workout';
+    const vol = sessionVolume(session);
+    const volStr = vol.total > 0 ? `${fmtVol(vol.total)} lbs${vol.mixed ? '*' : ''}` : '';
 
     html += `
       <div class="card" style="cursor:pointer;margin-bottom:8px;border-left:3px solid ${splitColor}" onclick="showSessionDetail(${si})">
@@ -1118,6 +1214,7 @@ function renderHistory() {
           <div>
             <div style="font-weight:600;font-size:15px;color:${splitColor}">${esc(splitName)}</div>
             <div style="color:var(--muted);font-size:13px;margin-top:2px">${exCount} exercises · ${setCount} sets · ${dur}</div>
+            ${volStr ? `<div style="color:var(--accent2);font-size:12px;font-weight:600;margin-top:4px">Volume: ${volStr}</div>` : ''}
           </div>
           <div style="color:var(--muted);font-size:12px">${d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}</div>
         </div>
@@ -1132,6 +1229,24 @@ function fmtVol(v) {
   return v.toLocaleString();
 }
 
+// Compute volume for a single session. Mixed kg/lbs sets are normalized to lbs
+// for the total, with a flag noting that conversion happened.
+function sessionVolume(session) {
+  let total = 0;
+  let hasKg = false, hasLbs = false;
+  session.exercises.forEach(ex => {
+    ex.sets.forEach(s => {
+      const reps = Number(s.reps) || 0;
+      const wt = Number(s.weight) || 0;
+      if (reps === 0 || wt === 0) return;
+      const unit = s.unit || 'lbs';
+      if (unit === 'kg') { hasKg = true; total += reps * wt * 2.20462; }
+      else { hasLbs = true; total += reps * wt; }
+    });
+  });
+  return { total: Math.round(total), mixed: hasKg && hasLbs, hasKg, hasLbs };
+}
+
 function showSessionDetail(idx) {
   const session = DB.sessions[idx];
   const d = new Date(session.date);
@@ -1139,15 +1254,46 @@ function showSessionDetail(idx) {
     (session.splitName || 'Workout') + ' — ' +
     d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 
-  let html = `<p style="color:var(--muted);font-size:13px;margin-bottom:12px">${session.duration ? 'Duration: ' + formatTime(session.duration) : ''}</p>`;
+  // Volume header: this session + delta vs previous same-split session
+  const thisVol = sessionVolume(session);
+  let deltaStr = '';
+  if (thisVol.total > 0) {
+    // Find the next-older session of the same split
+    const olderIdx = DB.sessions.findIndex((s, i) => i > idx && s.split === session.split);
+    if (olderIdx !== -1) {
+      const prevVol = sessionVolume(DB.sessions[olderIdx]);
+      if (prevVol.total > 0) {
+        const pct = Math.round(((thisVol.total - prevVol.total) / prevVol.total) * 100);
+        const arrow = pct > 0 ? '▲' : pct < 0 ? '▼' : '◆';
+        const color = pct > 0 ? 'var(--accent2)' : pct < 0 ? 'var(--orange)' : 'var(--muted)';
+        deltaStr = ` <span style="color:${color};font-weight:600">${arrow} ${pct >= 0 ? '+' : ''}${pct}%</span> <span style="color:var(--muted);font-size:12px">vs ${new Date(DB.sessions[olderIdx].date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>`;
+      }
+    }
+  }
+  const mixedNote = thisVol.mixed ? '<div style="color:var(--muted);font-size:11px;margin-top:2px">* includes kg converted to lbs</div>' : '';
+
+  let html = `<div style="background:var(--surface);border-radius:10px;padding:12px;margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline">
+      <div>
+        <div style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px">Total Volume</div>
+        <div style="font-size:22px;font-weight:700;color:var(--accent2)">${fmtVol(thisVol.total)} lbs${thisVol.mixed ? '*' : ''}${deltaStr}</div>
+        ${mixedNote}
+      </div>
+      <div style="color:var(--muted);font-size:13px;text-align:right">
+        ${session.duration ? formatTime(session.duration) : ''}
+      </div>
+    </div>
+  </div>`;
 
   session.exercises.forEach(ex => {
-    const photoData = (DB.photos && session.split) ? getPhoto(session.split, ex.name) : null;
+    const photoData = ex.photo || null;
     const photoThumb = photoData
-      ? `<button class="btn-ghost" onclick="openPhotoModal('${session.split}', '${esc(ex.name).replace(/'/g, "\\'")}')" style="padding:0;background:transparent;flex-shrink:0">
-           <img src="${photoData}" alt="" style="width:28px;height:28px;border-radius:6px;object-fit:cover;border:1px solid var(--border);display:block">
+      ? `<button class="btn-ghost" onclick="openHistoricalPhotoModal(${idx}, '${esc(ex.name).replace(/'/g, "\\'")}')" style="padding:0;background:transparent;flex-shrink:0">
+           <img src="${photoData}" alt="" style="width:32px;height:32px;border-radius:6px;object-fit:cover;border:1px solid var(--border);display:block">
          </button>`
-      : '';
+      : `<button class="btn-ghost" onclick="captureHistoricalPhoto(${idx}, '${esc(ex.name).replace(/'/g, "\\'")}')" title="Add photo" style="padding:4px 8px;flex-shrink:0;color:var(--muted);font-size:14px;background:transparent">
+           &#128247;
+         </button>`;
     html += `<div class="card" style="margin-bottom:8px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
         <div class="card-title" style="margin:0">${esc(ex.name)}</div>
@@ -1164,6 +1310,7 @@ function showSessionDetail(idx) {
   });
 
   document.getElementById('detailContent').innerHTML = html;
+  document.getElementById('shareSessionBtn').onclick = () => shareSession(idx);
   document.getElementById('deleteSessionBtn').onclick = () => {
     if (confirm('Delete this entire session?')) {
       DB.sessions.splice(idx, 1);
@@ -1173,6 +1320,58 @@ function showSessionDetail(idx) {
     }
   };
   document.getElementById('sessionDetailModal').classList.remove('hidden');
+}
+
+// ═══════════════════════════════════════════
+// SHARE SINGLE SESSION (plain-text, for LLM ingestion / pasting anywhere)
+// ═══════════════════════════════════════════
+function formatSessionAsText(session) {
+  const d = new Date(session.date);
+  const dateStr = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  const vol = sessionVolume(session);
+  const setCount = session.exercises.reduce((a, e) => a + e.sets.length, 0);
+
+  let out = `${session.splitName || 'Workout'} — ${dateStr}\n`;
+  if (session.duration) out += `Duration: ${formatTime(session.duration)}\n`;
+  if (vol.total > 0) out += `Total volume: ${vol.total.toLocaleString()} lbs${vol.mixed ? ' (kg sets converted)' : ''}\n`;
+  out += `Exercises: ${session.exercises.length} · Sets: ${setCount}\n\n`;
+
+  session.exercises.forEach(ex => {
+    out += `${ex.name}\n`;
+    ex.sets.forEach((s, i) => {
+      out += `  Set ${i + 1}: ${s.weight} ${s.unit || 'lbs'} × ${s.reps} reps\n`;
+    });
+    if (ex.notes) out += `  Notes: ${ex.notes}\n`;
+    out += '\n';
+  });
+
+  return out.trimEnd();
+}
+
+async function shareSession(idx) {
+  const session = DB.sessions[idx];
+  if (!session) return;
+  const text = formatSessionAsText(session);
+  const title = (session.splitName || 'Workout') + ' — ' + new Date(session.date).toLocaleDateString();
+
+  // Prefer native share when available (Android share sheet → Google Health, etc.)
+  if (navigator.share) {
+    try {
+      await navigator.share({ title, text });
+      return;
+    } catch(err) {
+      // User canceled or share failed — fall through to clipboard fallback
+      if (err && err.name === 'AbortError') return;
+    }
+  }
+  // Fallback: copy to clipboard
+  try {
+    await navigator.clipboard.writeText(text);
+    alert('Workout copied to clipboard.');
+  } catch(err) {
+    // Last-resort fallback: show in a prompt so user can copy manually
+    prompt('Copy this workout:', text);
+  }
 }
 
 // ═══════════════════════════════════════════
@@ -1340,7 +1539,7 @@ function renderInsights() {
     </div>`;
   }
 
-  // Volume trends
+  // Volume trends — per-session, chronological, per split
   const trendEntries = Object.entries(volumeTrends);
   if (trendEntries.length > 0) {
     html += `<div class="card insight-section">
@@ -1350,6 +1549,49 @@ function renderInsights() {
           <div class="insight-label">${esc(t.splitName)}</div>
           <div class="insight-value ${t.pct >= 0 ? 'tag-up' : 'tag-warn'}">${t.pct >= 0 ? '+' : ''}${t.pct}%</div>
         </div>`).join('')}
+    </div>`;
+  }
+
+  // Per-session volume chart — chronological bars per split (oldest → newest)
+  const perSplitVolumes = {};
+  splitKeys.forEach(sk => {
+    const splitSessions = DB.sessions.filter(s => s.split === sk);
+    if (splitSessions.length < 2) return;
+    // Chronological order (oldest first), up to last 12 sessions
+    const chrono = splitSessions.slice().reverse().slice(-12);
+    perSplitVolumes[sk] = chrono.map(s => ({
+      date: s.date,
+      vol: sessionVolume(s).total
+    }));
+  });
+  const volChartEntries = Object.entries(perSplitVolumes);
+  if (volChartEntries.length > 0) {
+    html += `<div class="card insight-section">
+      <div class="insight-section-title">📊 Volume Per Session</div>
+      ${volChartEntries.map(([sk, points]) => {
+        const maxVol = Math.max(...points.map(p => p.vol), 1);
+        const bars = points.map(p => {
+          const heightPct = Math.max(2, Math.round((p.vol / maxVol) * 100));
+          const dateLabel = new Date(p.date).toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' });
+          return `<div title="${dateLabel}: ${p.vol.toLocaleString()} lbs" style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;min-width:0">
+            <div style="width:100%;display:flex;align-items:flex-end;height:60px">
+              <div style="width:100%;background:var(--accent2);border-radius:3px 3px 0 0;height:${heightPct}%;min-height:2px"></div>
+            </div>
+            <div style="font-size:9px;color:var(--muted);white-space:nowrap;transform:rotate(-45deg);transform-origin:center;height:14px">${dateLabel}</div>
+          </div>`;
+        }).join('');
+        const latest = points[points.length - 1];
+        const first = points[0];
+        const pctChange = first.vol > 0 ? Math.round(((latest.vol - first.vol) / first.vol) * 100) : 0;
+        return `<div style="margin-bottom:18px">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+            <div style="font-weight:600;font-size:14px">${esc(SPLITS[sk]?.name || sk)}</div>
+            <div style="font-size:12px;color:var(--muted)">latest <strong style="color:var(--accent2)">${fmtVol(latest.vol)} lbs</strong> · ${pctChange >= 0 ? '+' : ''}${pctChange}% over ${points.length} sessions</div>
+          </div>
+          <div style="display:flex;gap:3px;align-items:flex-end;padding:0 2px">${bars}</div>
+        </div>`;
+      }).join('')}
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5">Tap-and-hold a bar to see its date and volume.</div>
     </div>`;
   }
 
@@ -1450,26 +1692,32 @@ function renderSettingsInfo() {
     ? 'No sessions yet — nothing to back up.'
     : DB.sessions.length + ' session' + (DB.sessions.length === 1 ? '' : 's') + ' ready to export.';
 
-  // Photos summary
+  // Photos summary — now per-session
   const photoEl = document.getElementById('settingsPhotoSummary');
   if (photoEl) {
-    const photoEntries = Object.entries(DB.photos || {});
-    if (photoEntries.length === 0) {
+    // Collect all session-level photos
+    const allPhotos = [];
+    DB.sessions.forEach((s, sIdx) => {
+      s.exercises.forEach(ex => {
+        if (ex.photo) allPhotos.push({ sessionIdx: sIdx, date: s.date, split: s.split, splitName: s.splitName || s.split, exName: ex.name, data: ex.photo });
+      });
+    });
+    if (allPhotos.length === 0) {
       photoEl.innerHTML = '<p style="color:var(--muted);font-size:13px">No photos yet. Tap the camera icon next to an exercise during a workout to add one.</p>';
     } else {
-      const totalBytes = photoEntries.reduce((a, [k, v]) => a + (v ? v.length : 0), 0);
+      const totalBytes = allPhotos.reduce((a, p) => a + p.data.length, 0);
       const totalKB = (totalBytes / 1024).toFixed(0);
-      const list = photoEntries.map(([k, v]) => {
-        const [splitKey, exName] = k.split('||');
+      const list = allPhotos.map(p => {
+        const dateLabel = new Date(p.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
         return `<div class="insight-row">
           <span class="insight-label" style="display:flex;align-items:center;gap:8px">
-            <img src="${v}" alt="" style="width:36px;height:36px;border-radius:6px;object-fit:cover;border:1px solid var(--border)">
-            <span><span style="text-transform:capitalize;color:var(--muted);font-size:11px">${esc(splitKey)}</span><br>${esc(exName)}</span>
+            <img src="${p.data}" alt="" style="width:36px;height:36px;border-radius:6px;object-fit:cover;border:1px solid var(--border)">
+            <span><span style="color:var(--muted);font-size:11px">${esc(p.splitName)} · ${dateLabel}</span><br>${esc(p.exName)}</span>
           </span>
-          <button class="btn btn-outline btn-sm" style="padding:6px 10px;font-size:12px" onclick="openPhotoModal('${esc(splitKey).replace(/'/g, "\\'")}', '${esc(exName).replace(/'/g, "\\'")}')">View</button>
+          <button class="btn btn-outline btn-sm" style="padding:6px 10px;font-size:12px" onclick="document.getElementById('settingsModal').classList.add('hidden');showSessionDetail(${p.sessionIdx})">View</button>
         </div>`;
       }).join('');
-      photoEl.innerHTML = `<p style="color:var(--muted);font-size:12px;margin-bottom:8px">${photoEntries.length} photo${photoEntries.length === 1 ? '' : 's'} · ~${totalKB} KB total</p>${list}`;
+      photoEl.innerHTML = `<p style="color:var(--muted);font-size:12px;margin-bottom:8px">${allPhotos.length} photo${allPhotos.length === 1 ? '' : 's'} · ~${totalKB} KB total</p>${list}`;
     }
   }
 
@@ -1489,13 +1737,12 @@ function renderSettingsInfo() {
 
 // ── JSON Export ──
 function exportJSON() {
-  if (DB.sessions.length === 0 && Object.keys(DB.photos || {}).length === 0) { alert('No data to export.'); return; }
+  if (DB.sessions.length === 0) { alert('No data to export.'); return; }
   const payload = {
     appVersion: APP_VERSION,
     schemaVersion: SCHEMA_VERSION,
     exportedAt: new Date().toISOString(),
-    sessions: DB.sessions,
-    photos: DB.photos || {}
+    sessions: DB.sessions
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
@@ -1534,30 +1781,30 @@ function handleImportFile(event) {
     const text = e.target.result;
     const isJSON = file.name.toLowerCase().endsWith('.json') || text.trim().startsWith('{');
     try {
-      const parsed = isJSON ? parseJSONImport(text) : { sessions: parseCSVImport(text), photos: {} };
+      const parsed = isJSON ? parseJSONImport(text) : { sessions: parseCSVImport(text), legacyPhotos: {} };
       if (!parsed.sessions || parsed.sessions.length === 0) {
         alert('No valid sessions found in this file.');
         return;
       }
-      confirmAndApplyImport(parsed.sessions, parsed.photos || {}, file.name);
+      confirmAndApplyImport(parsed.sessions, parsed.legacyPhotos || {}, file.name);
     } catch(err) {
       alert('Failed to read file: ' + err.message);
     }
   };
   reader.onerror = () => alert('Could not read file.');
   reader.readAsText(file);
-  // Reset the input so the same file can be re-imported if needed
   event.target.value = '';
 }
 
 function parseJSONImport(text) {
   const parsed = JSON.parse(text);
-  // Accept either { sessions: [...], photos: {} } (our export format) or a bare array
+  // Accept either { sessions: [...], photos?: {} } (legacy export) or a bare array
   const sessions = Array.isArray(parsed) ? parsed : parsed.sessions;
   if (!Array.isArray(sessions)) throw new Error('JSON does not contain a sessions array.');
   const validSessions = sessions.filter(s => s && s.date && Array.isArray(s.exercises));
-  const photos = (!Array.isArray(parsed) && parsed.photos && typeof parsed.photos === 'object') ? parsed.photos : {};
-  return { sessions: validSessions, photos };
+  // Legacy v1 photos format: {"splitKey||exerciseName": dataUrl}. We'll migrate at apply time.
+  const legacyPhotos = (!Array.isArray(parsed) && parsed.photos && typeof parsed.photos === 'object') ? parsed.photos : {};
+  return { sessions: validSessions, legacyPhotos };
 }
 
 // Reconstruct sessions from the flat CSV format produced by exportCSV
@@ -1640,17 +1887,32 @@ function parseCSVLine(line) {
   return out;
 }
 
-function confirmAndApplyImport(importedSessions, importedPhotos, fileName) {
+function confirmAndApplyImport(importedSessions, legacyPhotos, fileName) {
   const existingCount = DB.sessions.length;
   const importCount = importedSessions.length;
-  const importPhotoCount = Object.keys(importedPhotos || {}).length;
+  // Migrate any legacy top-level photos onto the imported sessions (most recent match)
+  const legacyKeys = Object.keys(legacyPhotos || {});
+  if (legacyKeys.length > 0) {
+    legacyKeys.forEach(k => {
+      const sep = k.indexOf('||');
+      if (sep === -1) return;
+      const splitKey = k.slice(0, sep);
+      const exName = k.slice(sep + 2);
+      const target = importedSessions.find(s => s.split === splitKey && s.exercises.some(e => e.name === exName));
+      if (!target) return;
+      const ex = target.exercises.find(e => e.name === exName);
+      if (ex && !ex.photo) ex.photo = legacyPhotos[k];
+    });
+  }
+  // Count per-session photos in the import
+  const importPhotoCount = importedSessions.reduce((a, s) => a + s.exercises.filter(e => e.photo).length, 0);
   const photoNote = importPhotoCount > 0 ? '\nAlso found ' + importPhotoCount + ' exercise photo' + (importPhotoCount === 1 ? '' : 's') + '.' : '';
   const mode = prompt(
     'Import "' + fileName + '"\n\n' +
     'Found ' + importCount + ' session' + (importCount === 1 ? '' : 's') + '. You currently have ' + existingCount + '.' + photoNote + '\n\n' +
     'Type one of:\n' +
-    '  MERGE  — add imported sessions, skipping duplicates (by date + split). Photos merged (imported photos win on conflict).\n' +
-    '  REPLACE — wipe current data and use only imported sessions and photos\n' +
+    '  MERGE  — add imported sessions, skipping duplicates (by date + split)\n' +
+    '  REPLACE — wipe current data and use only imported sessions\n' +
     '  CANCEL — do nothing',
     'MERGE'
   );
@@ -1663,13 +1925,12 @@ function confirmAndApplyImport(importedSessions, importedPhotos, fileName) {
   }
 
   if (choice === 'REPLACE') {
-    if (!confirm('REPLACE will delete all ' + existingCount + ' current sessions and ' + Object.keys(DB.photos || {}).length + ' photos. Continue?')) return;
+    const currentPhotoCount = DB.sessions.reduce((a, s) => a + s.exercises.filter(e => e.photo).length, 0);
+    if (!confirm('REPLACE will delete all ' + existingCount + ' current sessions and ' + currentPhotoCount + ' photos. Continue?')) return;
     DB.sessions = importedSessions;
-    DB.photos = importedPhotos || {};
     saveDB();
-    alert('Replaced. ' + DB.sessions.length + ' sessions, ' + Object.keys(DB.photos).length + ' photos now in IronLog.');
+    alert('Replaced. ' + DB.sessions.length + ' sessions now in IronLog.');
   } else {
-    // MERGE sessions: skip if same date + split already exists
     const keyOf = s => new Date(s.date).toISOString().slice(0,10) + '|' + (s.split || s.splitName || '');
     const existingKeys = new Set(DB.sessions.map(keyOf));
     let added = 0, skipped = 0;
@@ -1679,17 +1940,9 @@ function confirmAndApplyImport(importedSessions, importedPhotos, fileName) {
       existingKeys.add(keyOf(s));
       added++;
     });
-    // Sort newest first
     DB.sessions.sort((a, b) => new Date(b.date) - new Date(a.date));
-    // MERGE photos: imported wins on key conflict
-    let photosAdded = 0, photosReplaced = 0;
-    Object.entries(importedPhotos || {}).forEach(([k, v]) => {
-      if (DB.photos[k]) photosReplaced++; else photosAdded++;
-      DB.photos[k] = v;
-    });
     saveDB();
-    const photoMsg = importPhotoCount > 0 ? '\n\nPhotos added: ' + photosAdded + '\nPhotos replaced: ' + photosReplaced : '';
-    alert('Merge complete.\n\nSessions added: ' + added + '\nSessions skipped (duplicates): ' + skipped + '\nTotal sessions: ' + DB.sessions.length + photoMsg);
+    alert('Merge complete.\n\nSessions added: ' + added + '\nSessions skipped (duplicates): ' + skipped + '\nTotal sessions: ' + DB.sessions.length);
   }
   renderHistory();
   renderSettingsInfo();
