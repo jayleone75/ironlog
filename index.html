@@ -332,6 +332,7 @@ textarea{resize:vertical;min-height:60px}
     <div style="text-align:center;margin-bottom:14px">
       <img id="photoModalImg" alt="Exercise photo" style="max-width:100%;max-height:60vh;border-radius:10px;border:1px solid var(--border)">
     </div>
+    <div id="photoModalInheritHint" style="font-size:12px;color:var(--muted);text-align:center;margin:-6px 0 10px;font-style:italic;display:none"></div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-outline btn-sm" style="flex:1" id="photoModalReplaceBtn">Replace</button>
       <button class="btn btn-danger btn-sm" style="flex:1" id="photoModalDeleteBtn">Delete</button>
@@ -399,7 +400,7 @@ const SPLITS = {
 // ═══════════════════════════════════════════
 // VERSION & STORAGE KEYS
 // ═══════════════════════════════════════════
-const APP_VERSION = '2.4.0';
+const APP_VERSION = '2.5.0';
 const SCHEMA_VERSION = 2;
 const STORAGE_KEY = 'ironlog_v2';
 const BACKUP_KEY_PREFIX = 'ironlog_v2_backup_';
@@ -620,17 +621,49 @@ function handlePhotoSelected(event) {
 
 // Photo modal — used to view a photo with replace/delete actions.
 // ctx is either { kind: 'current', ei } or { kind: 'historical', sessionIdx, exerciseName }.
-function openCurrentPhotoModal(ei) {
+// Active-session photo viewer. Handles two cases:
+//   (a) Photo was taken in *this* session → today's photo, can replace or delete.
+//   (b) No photo yet but last session has one → preview only, with date label and a
+//       "Take new photo" action. (Deleting a not-yet-inherited preview does nothing.)
+function openActiveSessionPhotoModal(ei) {
   if (!currentSession || !currentSession.exercises[ei]) return;
   const ex = currentSession.exercises[ei];
-  if (!ex.photo) return;
-  document.getElementById('photoModalImg').src = ex.photo;
-  document.getElementById('photoModalTitle').textContent = ex.name;
-  document.getElementById('photoModalReplaceBtn').onclick = () => {
+  const currentPhoto = ex.photo || null;
+  const lastPhotoInfo = currentPhoto ? null : getLastPhotoForExercise(currentSession.split, ex.name);
+  const displayPhoto = currentPhoto || (lastPhotoInfo ? lastPhotoInfo.dataUrl : null);
+  if (!displayPhoto) return;
+
+  // Header date label
+  let titleSuffix = '';
+  if (currentPhoto) {
+    titleSuffix = ' — taken today';
+  } else if (lastPhotoInfo) {
+    const dateStr = new Date(lastPhotoInfo.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    titleSuffix = ' — from ' + dateStr;
+  }
+  document.getElementById('photoModalImg').src = displayPhoto;
+  document.getElementById('photoModalTitle').textContent = ex.name + titleSuffix;
+
+  // Inherited preview hint (under the image, set up statically in HTML)
+  const hintEl = document.getElementById('photoModalInheritHint');
+  if (currentPhoto) {
+    hintEl.style.display = 'none';
+    hintEl.textContent = '';
+  } else {
+    hintEl.style.display = 'block';
+    hintEl.textContent = 'This photo will carry over to today\'s session unless you take a new one.';
+  }
+
+  // Action buttons
+  const replaceBtn = document.getElementById('photoModalReplaceBtn');
+  const deleteBtn = document.getElementById('photoModalDeleteBtn');
+  replaceBtn.textContent = currentPhoto ? 'Replace' : 'Take New';
+  replaceBtn.onclick = () => {
     document.getElementById('photoModal').classList.add('hidden');
     capturePhotoFor(ei);
   };
-  document.getElementById('photoModalDeleteBtn').onclick = () => {
+  deleteBtn.style.display = currentPhoto ? '' : 'none';
+  deleteBtn.onclick = () => {
     if (!confirm('Delete the photo for ' + ex.name + '?')) return;
     deleteCurrentSessionPhoto(ei);
     document.getElementById('photoModal').classList.add('hidden');
@@ -646,11 +679,18 @@ function openHistoricalPhotoModal(sessionIdx, exerciseName) {
   if (!ex || !ex.photo) return;
   document.getElementById('photoModalImg').src = ex.photo;
   document.getElementById('photoModalTitle').textContent = exerciseName + ' — ' + new Date(s.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-  document.getElementById('photoModalReplaceBtn').onclick = () => {
+  // Hide inherited hint if present from a prior open
+  const hintEl = document.getElementById('photoModalInheritHint');
+  if (hintEl) hintEl.style.display = 'none';
+  const replaceBtn = document.getElementById('photoModalReplaceBtn');
+  const deleteBtn = document.getElementById('photoModalDeleteBtn');
+  replaceBtn.textContent = 'Replace';
+  deleteBtn.style.display = '';
+  replaceBtn.onclick = () => {
     document.getElementById('photoModal').classList.add('hidden');
     captureHistoricalPhoto(sessionIdx, exerciseName);
   };
-  document.getElementById('photoModalDeleteBtn').onclick = () => {
+  deleteBtn.onclick = () => {
     if (!confirm('Delete this photo?')) return;
     deleteHistoricalPhoto(sessionIdx, exerciseName);
     document.getElementById('photoModal').classList.add('hidden');
@@ -897,24 +937,25 @@ function renderExercises() {
       </div>
     `).join('');
 
-    // Photo for this exercise — current session first, else last session as faded reference
-    const currentPhoto = (ex.photo) || null;
-    const lastPhoto = currentPhoto ? null : getLastPhotoForExercise(currentSession.split, ex.name);
-    let photoBtnHtml;
-    if (currentPhoto) {
-      photoBtnHtml = `<button class="btn-ghost" onclick="openCurrentPhotoModal(${ei})" title="View photo" style="padding:2px 4px;flex-shrink:0;background:transparent">
-           <img src="${currentPhoto}" alt="" style="width:28px;height:28px;border-radius:6px;object-fit:cover;border:1px solid var(--border);display:block">
-         </button>`;
-    } else if (lastPhoto) {
-      photoBtnHtml = `<button class="btn-ghost" onclick="capturePhotoFor(${ei})" title="Capture today's photo (last session shown faded)" style="padding:2px 4px;flex-shrink:0;background:transparent;position:relative">
-           <img src="${lastPhoto.dataUrl}" alt="" style="width:28px;height:28px;border-radius:6px;object-fit:cover;border:1px dashed var(--muted);display:block;opacity:0.45">
-           <span style="position:absolute;bottom:-2px;right:-2px;background:var(--bg);color:var(--accent);font-size:14px;line-height:1;padding:1px;border-radius:50%">&#128247;</span>
-         </button>`;
-    } else {
-      photoBtnHtml = `<button class="btn-ghost" onclick="capturePhotoFor(${ei})" title="Take photo of machine" style="padding:4px 8px;flex-shrink:0;color:var(--muted);font-size:16px">
-           &#128247;
-         </button>`;
-    }
+    // Photo controls — three distinct slots:
+    //   1. Thumbnail (only if a photo exists — today's, or last session's as inheritable preview)
+    //   2. Camera button (always — taps to capture new photo for today)
+    // If user doesn't take a new photo, the last session's photo will be inherited at finish.
+    const currentPhoto = ex.photo || null;
+    const lastPhotoInfo = currentPhoto ? null : getLastPhotoForExercise(currentSession.split, ex.name);
+    const displayPhoto = currentPhoto || (lastPhotoInfo ? lastPhotoInfo.dataUrl : null);
+    const displayPhotoDate = currentPhoto ? null : (lastPhotoInfo ? lastPhotoInfo.date : null);
+    const isInherited = !currentPhoto && !!lastPhotoInfo;
+
+    const thumbnailHtml = displayPhoto
+      ? `<button class="btn-ghost" onclick="openActiveSessionPhotoModal(${ei})" title="View photo${isInherited ? ' (from last session)' : ''}" style="padding:0;background:transparent;flex-shrink:0">
+           <img src="${displayPhoto}" alt="" style="width:36px;height:36px;border-radius:6px;object-fit:cover;border:1px solid var(--border);display:block">
+         </button>`
+      : '';
+
+    const cameraBtnHtml = `<button class="btn-ghost" onclick="capturePhotoFor(${ei})" title="${displayPhoto ? 'Take a new photo' : 'Take photo of machine'}" style="padding:4px 8px;flex-shrink:0;color:var(--muted);font-size:18px;background:transparent">
+         &#128247;
+       </button>`;
 
     return `
       <div class="ex-card fade-in">
@@ -924,7 +965,8 @@ function renderExercises() {
             style="background:transparent;border:1px solid transparent;font-size:15px;font-weight:700;padding:4px 8px;border-radius:6px;flex:1;min-width:0"
             onfocus="this.style.borderColor='var(--border)';this.style.background='var(--surface)'"
             onblur="this.style.borderColor='transparent';this.style.background='transparent'">
-          ${photoBtnHtml}
+          ${thumbnailHtml}
+          ${cameraBtnHtml}
           <button class="btn-ghost" onclick="removeExercise(${ei})" style="color:var(--danger);font-size:12px;padding:2px 6px;flex-shrink:0">Remove</button>
         </div>
         ${lastStr}
@@ -1041,7 +1083,9 @@ function finishSession() {
     return;
   }
 
-  // Clean up: remove lastData refs, filter out empty sets, preserve photo if present
+  // Clean up: remove lastData refs, filter out empty sets. Preserve today's photo
+  // if user took one; otherwise inherit last session's photo for that exercise
+  // (silence = same machine as last time).
   currentSession.exercises = currentSession.exercises.map(ex => {
     const cleaned = {
       name: ex.name,
@@ -1052,7 +1096,14 @@ function finishSession() {
       })),
       notes: ex.notes || ''
     };
-    if (ex.photo) cleaned.photo = ex.photo;
+    if (ex.photo) {
+      cleaned.photo = ex.photo;
+    } else {
+      // Inherit last session's photo if available (DB.sessions doesn't include
+      // currentSession yet — unshift happens below — so "last" is genuinely prior)
+      const inherited = getLastPhotoForExercise(currentSession.split, ex.name);
+      if (inherited) cleaned.photo = inherited.dataUrl;
+    }
     return cleaned;
   }).filter(ex => ex.sets.length > 0);
 
