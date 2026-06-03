@@ -316,6 +316,11 @@ textarea{resize:vertical;min-height:60px}
       <div class="insight-row"><span class="insight-label">App version</span><span class="insight-value" id="settingsAppVersion">—</span></div>
       <div class="insight-row"><span class="insight-label">Data schema</span><span class="insight-value" id="settingsSchemaVersion">—</span></div>
       <div class="insight-row"><span class="insight-label">Sessions</span><span class="insight-value" id="settingsSessionCount">—</span></div>
+      <div class="insight-row"><span class="insight-label">Storage used</span><span class="insight-value" id="settingsStorageUsed">—</span></div>
+      <div id="settingsStorageBar" style="height:6px;border-radius:3px;background:var(--border);overflow:hidden;margin-top:6px">
+        <div id="settingsStorageBarFill" style="height:100%;width:0%;background:var(--accent2);transition:width .3s"></div>
+      </div>
+      <div id="settingsStorageNote" style="font-size:11px;color:var(--muted);margin-top:4px"></div>
     </div>
 
     <div style="margin-top:16px">
@@ -400,7 +405,7 @@ const SPLITS = {
 // ═══════════════════════════════════════════
 // VERSION & STORAGE KEYS
 // ═══════════════════════════════════════════
-const APP_VERSION = '2.5.0';
+const APP_VERSION = '2.5.1';
 const SCHEMA_VERSION = 2;
 const STORAGE_KEY = 'ironlog_v2';
 const BACKUP_KEY_PREFIX = 'ironlog_v2_backup_';
@@ -460,24 +465,97 @@ function migratePhotosToSessions(db) {
   });
 }
 
-function saveDB() {
-  // Rotate rolling backups BEFORE overwriting main key
+// Build a lightweight copy of the DB for rolling backups: workout data only,
+// photos stripped out. Photos are large and are protected by JSON export instead.
+// This keeps the rolling safety-net backups tiny so they never crowd out the real save.
+function buildBackupPayload() {
+  const lite = {
+    schemaVersion: SCHEMA_VERSION,
+    sessions: DB.sessions.map(s => ({
+      date: s.date,
+      split: s.split,
+      splitName: s.splitName,
+      duration: s.duration,
+      exercises: s.exercises.map(ex => ({
+        name: ex.name,
+        sets: ex.sets,
+        notes: ex.notes || ''
+        // photo deliberately omitted
+      }))
+    }))
+  };
+  return JSON.stringify(lite);
+}
+
+function rotateBackups() {
   try {
-    const current = localStorage.getItem(STORAGE_KEY);
-    if (current) {
-      // Shift: backup_2 -> backup_3, backup_1 -> backup_2, current -> backup_1
-      for (let i = BACKUP_GENERATIONS - 1; i >= 1; i--) {
-        const older = localStorage.getItem(BACKUP_KEY_PREFIX + i);
-        if (older) localStorage.setItem(BACKUP_KEY_PREFIX + (i + 1), older);
+    const liteCurrent = buildBackupPayload();
+    for (let i = BACKUP_GENERATIONS - 1; i >= 1; i--) {
+      const older = localStorage.getItem(BACKUP_KEY_PREFIX + i);
+      if (older) {
+        try { localStorage.setItem(BACKUP_KEY_PREFIX + (i + 1), older); }
+        catch(e) { /* drop oldest silently if no room */ }
       }
-      localStorage.setItem(BACKUP_KEY_PREFIX + '1', current);
     }
+    localStorage.setItem(BACKUP_KEY_PREFIX + '1', liteCurrent);
   } catch(e) {
-    // If quota exceeded on backups, don't block the main save
-    console.warn('Backup rotation failed:', e);
+    console.warn('Backup rotation skipped:', e);
   }
+}
+
+// Save the real DB. The primary write is bulletproof: if storage is full, we
+// progressively free space (drop backups oldest-first) and retry, so the user's
+// actual workout data is never lost to a quota error. Returns true on success.
+function saveDB() {
   DB.schemaVersion = SCHEMA_VERSION;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
+  // Rotate backups first (these are small now — photos stripped)
+  rotateBackups();
+
+  const payload = JSON.stringify(DB);
+  // Attempt the main save; on quota failure, free space and retry.
+  if (trySetItem(STORAGE_KEY, payload)) return true;
+
+  // Retry path: drop backups one at a time, oldest first, retrying after each.
+  for (let i = BACKUP_GENERATIONS; i >= 1; i--) {
+    localStorage.removeItem(BACKUP_KEY_PREFIX + i);
+    if (trySetItem(STORAGE_KEY, payload)) {
+      console.warn('Saved after dropping backup slot ' + i + ' to free space.');
+      return true;
+    }
+  }
+
+  // Still failing — surface a clear, non-destructive error. Data stays in memory
+  // and in autosave; nothing is lost, but the user must free space.
+  alert('⚠️ Storage is full — your workout is still safe in memory, but couldn\'t be saved permanently yet.\n\nOpen Settings → free up space by deleting some exercise photos, then try again. Your data has NOT been lost.');
+  return false;
+}
+
+// Attempt a single localStorage write, returning false on quota error.
+function trySetItem(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch(e) {
+    if (e && (e.name === 'QuotaExceededError' || e.code === 22 || e.code === 1014)) {
+      return false;
+    }
+    throw e; // unexpected error — let it bubble
+  }
+}
+
+// Estimate total localStorage usage for this app (and overall) in KB.
+function estimateStorageUsage() {
+  let appBytes = 0, totalBytes = 0;
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      const v = localStorage.getItem(k) || '';
+      const bytes = (k.length + v.length) * 2; // UTF-16 ~2 bytes/char
+      totalBytes += bytes;
+      if (k === STORAGE_KEY || k.startsWith(BACKUP_KEY_PREFIX) || k === 'ironlog_autosave') appBytes += bytes;
+    }
+  } catch(e) { /* ignore */ }
+  return { appKB: Math.round(appBytes / 1024), totalKB: Math.round(totalBytes / 1024) };
 }
 
 function listBackups() {
@@ -1083,37 +1161,51 @@ function finishSession() {
     return;
   }
 
-  // Clean up: remove lastData refs, filter out empty sets. Preserve today's photo
-  // if user took one; otherwise inherit last session's photo for that exercise
-  // (silence = same machine as last time).
-  currentSession.exercises = currentSession.exercises.map(ex => {
-    const cleaned = {
-      name: ex.name,
-      sets: ex.sets.filter(s => s.reps || s.weight).map(s => ({
-        reps: Number(s.reps) || 0,
-        weight: Number(s.weight) || 0,
-        unit: s.unit || 'lbs'
-      })),
-      notes: ex.notes || ''
-    };
-    if (ex.photo) {
-      cleaned.photo = ex.photo;
-    } else {
-      // Inherit last session's photo if available (DB.sessions doesn't include
-      // currentSession yet — unshift happens below — so "last" is genuinely prior)
-      const inherited = getLastPhotoForExercise(currentSession.split, ex.name);
-      if (inherited) cleaned.photo = inherited.dataUrl;
-    }
-    return cleaned;
-  }).filter(ex => ex.sets.length > 0);
+  try {
+    // Clean up: remove lastData refs, filter out empty sets. Preserve today's photo
+    // if user took one; otherwise inherit last session's photo for that exercise
+    // (silence = same machine as last time).
+    const cleanedExercises = currentSession.exercises.map(ex => {
+      const cleaned = {
+        name: ex.name,
+        sets: ex.sets.filter(s => s.reps || s.weight).map(s => ({
+          reps: Number(s.reps) || 0,
+          weight: Number(s.weight) || 0,
+          unit: s.unit || 'lbs'
+        })),
+        notes: ex.notes || ''
+      };
+      if (ex.photo) {
+        cleaned.photo = ex.photo;
+      } else {
+        const inherited = getLastPhotoForExercise(currentSession.split, ex.name);
+        if (inherited) cleaned.photo = inherited.dataUrl;
+      }
+      return cleaned;
+    }).filter(ex => ex.sets.length > 0);
 
-  currentSession.duration = Math.floor((Date.now() - sessionStart) / 1000);
-  delete currentSession.color; // don't need in storage
-  DB.sessions.unshift(currentSession);
-  saveDB();
-  clearAutosave();
-  endSession();
-  document.querySelectorAll('.tab')[2].click();
+    currentSession.exercises = cleanedExercises;
+    currentSession.duration = Math.floor((Date.now() - sessionStart) / 1000);
+    delete currentSession.color;
+
+    // Add to DB and attempt to persist. Only finalize if the save actually succeeded.
+    DB.sessions.unshift(currentSession);
+    const saved = saveDB();
+    if (!saved) {
+      // Save failed (storage full). Roll back the in-memory add so we don't show a
+      // phantom session, keep the autosave intact, and leave the user in the workout.
+      DB.sessions.shift();
+      return; // saveDB already alerted the user with guidance
+    }
+
+    clearAutosave();
+    endSession();
+    document.querySelectorAll('.tab')[2].click();
+  } catch(err) {
+    // Any unexpected failure: do NOT clear autosave — the workout stays recoverable.
+    alert('Something went wrong finishing the workout, but your data is safe and still recoverable.\n\nError: ' + (err && err.message ? err.message : err) + '\n\nTry again, or export from Settings before reloading.');
+    console.error('finishSession error:', err);
+  }
 }
 
 function cancelSession() {
@@ -1742,6 +1834,26 @@ function renderSettingsInfo() {
   document.getElementById('settingsBackupStatus').textContent = DB.sessions.length === 0
     ? 'No sessions yet — nothing to back up.'
     : DB.sessions.length + ' session' + (DB.sessions.length === 1 ? '' : 's') + ' ready to export.';
+
+  // Storage usage meter (cap is browser-dependent; ~5MB is the typical mobile limit)
+  const usage = estimateStorageUsage();
+  const ASSUMED_CAP_KB = 5120;
+  const pct = Math.min(100, Math.round((usage.appKB / ASSUMED_CAP_KB) * 100));
+  const usedEl = document.getElementById('settingsStorageUsed');
+  const barEl = document.getElementById('settingsStorageBarFill');
+  const noteEl = document.getElementById('settingsStorageNote');
+  if (usedEl) usedEl.textContent = (usage.appKB / 1024).toFixed(2) + ' MB';
+  if (barEl) {
+    barEl.style.width = pct + '%';
+    barEl.style.background = pct >= 85 ? 'var(--danger)' : pct >= 65 ? 'var(--orange)' : 'var(--accent2)';
+  }
+  if (noteEl) {
+    noteEl.textContent = pct >= 85
+      ? '⚠️ Nearly full. Delete some photos to avoid save failures.'
+      : pct >= 65
+      ? 'Getting full — consider trimming older photos soon.'
+      : 'About ' + pct + '% of the typical browser limit.';
+  }
 
   // Photos summary — now per-session
   const photoEl = document.getElementById('settingsPhotoSummary');
